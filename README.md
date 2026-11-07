@@ -6,7 +6,7 @@ Write in the air with your index finger. One Python file, a webcam, and a small 
 
 Install **Git** and **Python 3.12 with Tkinter** first. Use the standard Python installer with Tcl/Tk enabled. On Windows, include the Python launcher (`py`).
 
-This repository is private; authenticate Git with your GitHub account first. These commands clone into a new `AirInk` folder, install the project dependencies and launch the app.
+This repository is public; no GitHub sign-in is needed to download it. These commands clone into a new `AirInk` folder, install the project dependencies and launch the app.
 
 macOS — Terminal:
 

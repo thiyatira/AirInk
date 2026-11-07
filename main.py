@@ -39,11 +39,38 @@ def writing_pose(hand):
     return raised == [True, False, False, False] and not thumb_open
 
 
+class OneEuro:
+    """1€ filter (Casiez et al., 2012): strong smoothing when slow, little lag when fast."""
+
+    def __init__(self, min_cutoff=1.0, beta=0.01, d_cutoff=1.0):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.reset()
+
+    def reset(self):
+        self.x = self.speed = self.t = None
+
+    def __call__(self, point, t):
+        x = np.array(point, dtype=float)
+        if self.x is None:
+            self.x, self.speed, self.t = x, np.zeros(2), t
+            return tuple(point)
+        dt, self.t = max(t - self.t, 1e-3), t
+
+        def alpha(cutoff):
+            return 1 / (1 + 1 / (2 * np.pi * cutoff * dt))
+
+        self.speed += alpha(self.d_cutoff) * ((x - self.x) / dt - self.speed)
+        cutoff = self.min_cutoff + self.beta * np.linalg.norm(self.speed)
+        self.x += alpha(cutoff) * (x - self.x)
+        return tuple(int(round(v)) for v in self.x)
+
+
 class AirInk:
     def __init__(self, root):
         self.root, self.camera, self.tracker = root, None, None
         self.previous, self.pose_frames, self.timestamp = None, 0, 0
-        self.failed_reads, self.after_id = 0, None
+        self.failed_reads, self.after_id, self.missed = 0, None, 0
+        self.smoother = OneEuro()
         self.color = COLORS[0]
         self.ink = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
         self.mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
@@ -123,7 +150,7 @@ class AirInk:
             ttk.Radiobutton(row, text=name, value=name, variable=self.view).pack(side="left")
         title("CAMERA ZOOM")
         ttk.Scale(panel, from_=1, to=2.5, variable=self.zoom,
-                  command=lambda value: self.reset_stroke()).pack(fill="x", padx=18)
+                  command=lambda value: (self.reset_stroke(), self.smoother.reset())).pack(fill="x", padx=18)
         title("CAMERA OPACITY")
         ttk.Scale(panel, from_=0, to=100, variable=self.opacity).pack(fill="x", padx=18, pady=(0, 10))
         row = tk.Frame(panel, bg="white")
@@ -185,18 +212,17 @@ class AirInk:
             self.tracker.close()
         self.camera = self.tracker = None
         self.pose_frames = 0
+        self.smoother.reset()
         self.reset_stroke()
         self.camera_button.configure(text="Start camera")
         self.status.set("Camera off")
 
-    def draw(self, point, smooth=True):
+    def draw(self, point, camera=True):
         point = tuple(int(np.clip(v, 0, limit - 1))
                       for v, limit in zip(point, (WIDTH, HEIGHT)))
-        if smooth and self.previous is not None:
+        if camera and self.previous is not None:
             if np.linalg.norm(np.subtract(point, self.previous)) > 120:
-                self.reset_stroke()
-            else:
-                point = tuple(int(0.5 * a + 0.5 * b) for a, b in zip(point, self.previous))
+                self.reset_stroke()  # tracking jump: don't draw a bridge
         start = self.previous or point
         erase = self.tool.get() == "Eraser"
         thickness = max(24, self.size.get() * 4) if erase else max(2, self.size.get())
@@ -207,7 +233,7 @@ class AirInk:
 
     def mouse_draw(self, event):
         if self.camera is None:
-            self.draw((event.x, event.y), smooth=False)
+            self.draw((event.x, event.y), camera=False)
 
     def compose(self, background=None):
         if background is None:
@@ -267,15 +293,24 @@ class AirInk:
         preview = self.camera_view(frame)
         hand = result.hand_landmarks[0] if result.hand_landmarks else None
         point = self.view_point(hand[8]) if hand else None
+        if point is None:
+            self.smoother.reset()
+        else:
+            point = self.smoother(point, self.timestamp / 1000)
         writing = point is not None and writing_pose(hand)
-        self.pose_frames = self.pose_frames + 1 if writing else 0
+        # Start after 3 good frames; stop after 3 missed ones, so one bad frame won't split a line.
+        self.missed = 0 if writing else self.missed + 1
+        if writing:
+            self.pose_frames += 1
+        elif self.missed >= 3:
+            self.pose_frames = 0
         self.status.set(("Drawing" if self.tool.get() == "Pen" else "Erasing")
-                        if self.pose_frames >= 3 else
+                        if self.pose_frames >= 3 and writing else
                         ("Move to the centre" if hand and point is None else
                          "Move / pause" if hand else "Show your hand"))
-        if self.pose_frames >= 3:
+        if self.pose_frames >= 3 and writing:
             self.draw(point)
-        else:
+        elif self.pose_frames < 3:
             self.reset_stroke()
         return (preview if self.view.get() == "Camera" else None), point
 

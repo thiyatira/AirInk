@@ -43,6 +43,7 @@ class AirInk:
     def __init__(self, root):
         self.root, self.camera, self.tracker = root, None, None
         self.previous, self.pose_frames, self.timestamp = None, 0, 0
+        self.failed_reads, self.after_id = 0, None
         self.color = COLORS[0]
         self.ink = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
         self.mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
@@ -172,7 +173,7 @@ class AirInk:
             messagebox.showerror("Camera could not start", str(error))
             return
         self.camera, self.tracker = camera, tracker
-        self.pose_frames = 0
+        self.pose_frames = self.failed_reads = 0
         self.reset_stroke()
         self.camera_button.configure(text="Stop camera")
         self.status.set("Show your hand")
@@ -188,10 +189,10 @@ class AirInk:
         self.camera_button.configure(text="Start camera")
         self.status.set("Camera off")
 
-    def draw(self, point):
+    def draw(self, point, smooth=True):
         point = tuple(int(np.clip(v, 0, limit - 1))
                       for v, limit in zip(point, (WIDTH, HEIGHT)))
-        if self.previous is not None:
+        if smooth and self.previous is not None:
             if np.linalg.norm(np.subtract(point, self.previous)) > 120:
                 self.reset_stroke()
             else:
@@ -206,7 +207,7 @@ class AirInk:
 
     def mouse_draw(self, event):
         if self.camera is None:
-            self.draw((event.x, event.y))
+            self.draw((event.x, event.y), smooth=False)
 
     def compose(self, background=None):
         if background is None:
@@ -219,7 +220,8 @@ class AirInk:
     def camera_view(self, frame):
         """Crop only the display; the tracker receives the full camera frame."""
         height, width = frame.shape[:2]
-        crop_w, crop_h = round(width / self.zoom.get()), round(height / self.zoom.get())
+        fit_w, fit_h = min(width, height * WIDTH / HEIGHT), min(height, width * HEIGHT / WIDTH)
+        crop_w, crop_h = round(fit_w / self.zoom.get()), round(fit_h / self.zoom.get())
         left, top = (width - crop_w) // 2, (height - crop_h) // 2
         self.crop = (left / width, top / height, crop_w / width, crop_h / height)
         return cv2.resize(frame[top:top + crop_h, left:left + crop_w], (WIDTH, HEIGHT))
@@ -232,41 +234,50 @@ class AirInk:
         return None
 
     def tick(self):
-        background = None
-        point = None
-        if self.camera is not None:
-            try:
-                ok, frame = self.camera.read()
-                if not ok:
-                    raise RuntimeError("Camera disconnected. You can continue with the mouse.")
-                frame = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
-                self.timestamp = max(self.timestamp + 1, time.monotonic_ns() // 1_000_000)
-                result = self.tracker.detect_for_video(
-                    mp.Image(image_format=mp.ImageFormat.SRGB, data=frame), self.timestamp)
-                preview = self.camera_view(frame)
-                hand = result.hand_landmarks[0] if result.hand_landmarks else None
-                point = self.view_point(hand[8]) if hand else None
-                writing = point is not None and writing_pose(hand)
-                self.pose_frames = self.pose_frames + 1 if writing else 0
-                self.status.set(("Drawing" if self.tool.get() == "Pen" else "Erasing")
-                                if self.pose_frames >= 3 else
-                                ("Move to the centre" if hand and point is None else
-                                 "Move / pause" if hand else "Show your hand"))
-                if self.pose_frames >= 3:
-                    self.draw(point)
-                else:
-                    self.reset_stroke()
-                if self.view.get() == "Camera":
-                    background = preview
-            except Exception as error:
-                self.stop_camera()
-                messagebox.showerror("Camera stopped", str(error))
-        picture = self.compose(background)
-        if self.camera is not None and point is not None:
-            cv2.circle(picture, point, 10, (22, 155, 131), 2)
-        self.photo = ImageTk.PhotoImage(Image.fromarray(picture))
-        self.screen.configure(image=self.photo)
-        self.after_id = self.root.after(20, self.tick)
+        background = point = None
+        try:
+            if self.camera is not None:
+                background, point = self.camera_step()
+        except Exception as error:
+            self.stop_camera()
+            messagebox.showerror("Camera stopped", str(error))
+        try:
+            picture = self.compose(background)
+            if self.camera is not None and point is not None:
+                cv2.circle(picture, point, 10, (22, 155, 131), 2)
+            self.photo = ImageTk.PhotoImage(Image.fromarray(picture))
+            self.screen.configure(image=self.photo)
+        finally:
+            self.after_id = self.root.after(20, self.tick)
+
+    def camera_step(self):
+        """Read one frame, track the hand, draw if the pose holds; return (background, point)."""
+        ok, frame = self.camera.read()
+        if not ok:  # macOS often returns empty frames while the camera warms up
+            self.failed_reads += 1
+            if self.failed_reads > 100:
+                raise RuntimeError("Camera disconnected. You can continue with the mouse.")
+            self.status.set("Starting camera…")
+            return None, None
+        self.failed_reads = 0
+        frame = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
+        self.timestamp = max(self.timestamp + 1, time.monotonic_ns() // 1_000_000)
+        result = self.tracker.detect_for_video(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=frame), self.timestamp)
+        preview = self.camera_view(frame)
+        hand = result.hand_landmarks[0] if result.hand_landmarks else None
+        point = self.view_point(hand[8]) if hand else None
+        writing = point is not None and writing_pose(hand)
+        self.pose_frames = self.pose_frames + 1 if writing else 0
+        self.status.set(("Drawing" if self.tool.get() == "Pen" else "Erasing")
+                        if self.pose_frames >= 3 else
+                        ("Move to the centre" if hand and point is None else
+                         "Move / pause" if hand else "Show your hand"))
+        if self.pose_frames >= 3:
+            self.draw(point)
+        else:
+            self.reset_stroke()
+        return (preview if self.view.get() == "Camera" else None), point
 
     def clear(self):
         self.ink.fill(0)
@@ -308,7 +319,10 @@ class AirInk:
             messagebox.showerror("Could not open", str(error))
 
     def close(self):
+        if self.after_id is None:
+            return
         self.root.after_cancel(self.after_id)
+        self.after_id = None
         self.stop_camera()
         self.root.destroy()
 

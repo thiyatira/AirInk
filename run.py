@@ -21,6 +21,9 @@ def main():
         venv.EnvBuilder(with_pip=True).create(environment)
     if not stamp.exists() or stamp.read_bytes() != requirements:
         print("Installing AirInk dependencies...", flush=True)
+        # Environments made by other tools (e.g. uv) may lack pip.
+        subprocess.run([str(python), "-m", "ensurepip", "--upgrade"],
+                       check=True, stdout=subprocess.DEVNULL)
         subprocess.run([str(python), "-m", "pip", "install", "-r",
                         str(ROOT / "requirements.txt")], check=True)
         stamp.write_bytes(requirements)

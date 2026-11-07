@@ -29,7 +29,7 @@ To run again, open the project folder in a terminal:
 - **Only index finger raised:** write. Keep the thumb and other fingers folded.
 - **Other poses:** pause.
 - **Pen / Eraser, colour, brush size:** change your drawing tool.
-- **Zoom / Opacity / Board:** adjust the view.
+- **Opacity / Board:** fade the camera or switch to a white board.
 - **Save / Open:** save a PNG or reopen it to continue. Each save creates a new copy.
 - **Clear:** erase the canvas. **Esc:** exit. Camera off: draw with the mouse.
 

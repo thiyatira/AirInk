@@ -96,6 +96,6 @@ documents/
 AirInk_Project.zip            Complete project to share
 ```
 
-The 11-slide presentation includes speaker notes. The 7-page report is available as PDF and editable Word. For the same slide appearance on another computer, install the fonts in `documents/fonts/`, or present the PDF.
+The 10-slide presentation includes speaker notes. The 7-page report is available as PDF and editable Word. For the same slide appearance on another computer, install the fonts in `documents/fonts/`, or present the PDF.
 
 All 38 automated checks passed on macOS, covering gestures, zoom, opacity, storage, reopening and setup failures. Windows storage paths were verified with simulated platform settings. Live webcam and native Windows checks still need to be done on the presentation computer.

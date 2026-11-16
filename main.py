@@ -1,43 +1,81 @@
 """AirInk: raise only your index finger to write."""
 
+import json
 import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import cv2
 import mediapipe as mp
 import numpy as np
 from PIL import Image, ImageTk
 
-WIDTH, HEIGHT = 960, 540
+import art
+from art import HEIGHT, WIDTH
+
 ROOT = Path(__file__).resolve().parent
-COLORS = ("#2563eb", "#172033", "#e34b65", "#169b83", "#e7a52b", "#8b5cf6")
-BG, PANEL, TEXT, MUTED = "#f3f5f9", "white", "#172033", "#67758a"
+FONT = "Segoe UI" if sys.platform == "win32" else "Helvetica"
+PAD, GAP, LEFT, RIGHT = 18, 12, 136, 236
+TOTAL = 2 * PAD + LEFT + 2 * GAP + WIDTH + RIGHT
+UNDO_LIMIT, UNDO_HOLD = 30, 1.2  # undo steps kept; seconds to hold ✌ for undo
+
+PALETTE = ("#2563eb", "#06b6d4", "#169b83", "#22c55e", "#facc15", "#f97316",
+           "#e34b65", "#ec4899", "#8b5cf6", "#92400e", "#172033", "#ffffff")
+TOOLS = (("Draw", "✎"), ("Eraser", "⌫"), ("Shapes", "◇"), ("Flowers", "✿"))
+BRUSHES = {  # name: (button label, opacity)
+    "Pen": ("✎ Pen", 1.0), "Marker": ("▮ Marker", 0.9), "Highlighter": ("▬ Highlighter", 0.38),
+    "Neon": ("✦ Neon glow", 1.0), "Rainbow": ("◐ Rainbow", 1.0), "Dotted": ("⋯ Dotted", 1.0),
+    "Spray": ("⁂ Spray", 1.0), "Calligraphy": ("✒ Calligraphy", 1.0), "Chalk": ("▒ Chalk", 0.95)}
+SHAPE_ICONS = dict(zip(art.SHAPES, "─→▭◯△☆♡◇"))
+FLOWER_ICONS = dict(zip(art.FLOWERS, "✿❀⚘❁✾❦❋❧"))
+STATUS_COLORS = {"draw": "#16a34a", "pause": "#d97706", "idle": "#64748b", "undo": "#9333ea"}
+THEMES = {
+    "Pastel Dream": dict(bg="#f5f0ff", panel="#ffffff", text="#3b2a5a", muted="#8b7bab", accent="#8b5cf6",
+                         hover="#ece3ff", button="#f4eeff", grad=("#c4b5fd", "#f9a8d4", "#93c5fd")),
+    "Neon Night": dict(bg="#0b0b16", panel="#16162b", text="#ecebff", muted="#8f8cc0", accent="#a855f7",
+                       hover="#302c5c", button="#222041", grad=("#6d28d9", "#a855f7", "#06b6d4")),
+    "Sunny Vibes": dict(bg="#fff7ed", panel="#ffffff", text="#4a2c0a", muted="#b07a3c", accent="#f97316",
+                        hover="#ffe2c2", button="#fff1e0", grad=("#fb923c", "#facc15", "#2dd4bf")),
+    "Ocean Glass": dict(bg="#e6f4ff", panel="#f8fbff", text="#0c3b5e", muted="#5a87a8", accent="#0ea5e9",
+                        hover="#d3eaff", button="#eaf5ff", grad=("#38bdf8", "#818cf8", "#c084fc")),
+    "Classic": dict(bg="#f3f5f9", panel="#ffffff", text="#172033", muted="#67758a", accent="#2563eb",
+                    hover="#dfe7f4", button="#edf1f7", grad=("#1d4ed8", "#2563eb", "#60a5fa")),
+}
 
 
-def storage_folder():
+def app_folder():
     if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     elif sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support"
     else:
         base = Path.home() / ".local" / "share"
-    return base / "AirInk" / "drawings"
+    return base / "AirInk"
 
 
-def writing_pose(hand):
-    """Write only with the index finger; keep every other finger folded."""
+def storage_folder():
+    return app_folder() / "drawings"
+
+
+def gesture(hand):
+    """Name the hand pose: point (only index up), peace, palm, fist or other."""
     raised = [hand[tip].y < hand[tip - 2].y - 0.025 for tip in (8, 12, 16, 20)]
 
     def distance(a, b):
         return np.hypot(hand[a].x - hand[b].x, hand[a].y - hand[b].y)
 
     thumb_open = distance(4, 17) > 1.15 * distance(3, 17)
-    return raised == [True, False, False, False] and not thumb_open
+    if raised == [True, False, False, False]:
+        return "other" if thumb_open else "point"
+    if raised == [True, True, False, False]:
+        return "peace"
+    if all(raised):
+        return "palm"
+    return "other" if any(raised) else "fist"
 
 
 class OneEuro:
@@ -70,98 +108,321 @@ class AirInk:
         self.root, self.camera, self.tracker = root, None, None
         self.stroke, self.pose_frames, self.missed = [], 0, 0
         self.timestamp, self.failed_reads, self.after_id = 0, 0, None
-        self.smoother, self.color = OneEuro(), COLORS[0]
+        self.smoother, self.color, self.rng = OneEuro(), PALETTE[0], np.random.default_rng()
         self.ink = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)   # colour of each pixel
         self.mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)     # 0 = empty, 255 = ink
-        self.crop = (0, 0, 1, 1)
-        self.tool, self.view = tk.StringVar(value="Pen"), tk.StringVar(value="Camera")
-        self.size, self.opacity = tk.IntVar(value=6), tk.IntVar(value=60)
-        self.status = tk.StringVar(value="Camera off")
+        self.layer = art.Layer()                                  # the stroke in progress
+        self.painter = art.Painter(self.layer)
+        self.undo_stack, self.redo_stack = [], []
+        self.active, self.hover, self.last_frame = None, None, None
+        self.travel = self.carry = self.hue0 = 0.0
+        self.shape_start = self.shape_end = self.last_stamp = None
+        self.peace_since, self.peace_missed, self.peace_done = None, 0, False
+        self.crop, self.toast_id, self.boards = (0, 0, 1, 1), None, {}
+        self.status_state = ("Camera off · draw with the mouse", "idle")
+
+        settings = self.load_settings()
+        self.theme = tk.StringVar(value=settings.get("theme") if settings.get("theme") in THEMES else "Pastel Dream")
+        self.board = tk.StringVar(value=settings.get("board") if settings.get("board") in art.BOARDS else "White")
+        self.tool, self.brush = tk.StringVar(value="Draw"), tk.StringVar(value="Pen")
+        self.shape, self.flower = tk.StringVar(value="Rectangle"), tk.StringVar(value="Daisy")
+        self.fill, self.natural = tk.BooleanVar(value=False), tk.BooleanVar(value=True)
+        self.stem, self.trail = tk.BooleanVar(value=True), tk.BooleanVar(value=False)
+        self.view = tk.StringVar(value="Camera")
+        self.size, self.alpha, self.opacity = tk.IntVar(value=6), tk.IntVar(value=100), tk.IntVar(value=60)
+        self.status, self.toast_text, self.hex = tk.StringVar(), tk.StringVar(), tk.StringVar(value=self.color)
+
         root.title("AirInk")
-        root.configure(bg=BG)
         root.resizable(False, False)
         self.build_ui()
+        mod = "Command" if sys.platform == "darwin" else "Control"
+        for keys, action in (((f"<{mod}-z>",), self.undo), ((f"<{mod}-Z>", f"<{mod}-y>"), self.redo),
+                             ((f"<{mod}-s>",), self.save), (("<bracketleft>",), lambda: self.nudge_size(-2)),
+                             (("<bracketright>",), lambda: self.nudge_size(2))):
+            for key in keys:
+                root.bind(key, lambda event, action=action: action())
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Escape>", lambda event: self.close())
         self.tick()
 
+    # ---------- settings ----------
+    @staticmethod
+    def load_settings():
+        try:
+            return json.loads((app_folder() / "settings.json").read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def save_settings(self):
+        try:
+            app_folder().mkdir(parents=True, exist_ok=True)
+            (app_folder() / "settings.json").write_text(json.dumps(
+                {"theme": self.theme.get(), "board": self.board.get()}))
+        except OSError:
+            pass
+
     # ---------- interface ----------
     def build_ui(self):
+        for child in self.root.winfo_children():
+            child.destroy()
+        t = self.t = THEMES[self.theme.get()]
+        self.chips, self.swatches = [], {}
+        self.root.configure(bg=t["bg"])
+        for option, value in (("background", t["panel"]), ("foreground", t["text"]),
+                              ("selectBackground", t["accent"]), ("selectForeground", "white")):
+            self.root.option_add(f"*TCombobox*Listbox.{option}", value)
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("TButton", font=("Helvetica", 11), padding=(10, 9),
-                        background="#edf1f7", foreground=TEXT, borderwidth=0)
-        style.map("TButton", background=[("active", "#dfe7f4")])
-        style.configure("Accent.TButton", background="#2563eb", foreground="white")
-        style.map("Accent.TButton", background=[("active", "#1e4aa3")])
-        style.configure("TRadiobutton", background=PANEL, font=("Helvetica", 11))
-        style.configure("TScale", background="#2563eb", troughcolor="#edf1f7", borderwidth=0)
+        style.configure("Horizontal.TScale", background=t["accent"], troughcolor=t["button"],
+                        bordercolor=t["panel"], lightcolor=t["accent"], darkcolor=t["accent"])
+        style.configure("TCombobox", fieldbackground=t["panel"], background=t["button"], foreground=t["text"],
+                        arrowcolor=t["text"], bordercolor=t["panel"], lightcolor=t["panel"], darkcolor=t["panel"])
+        style.map("TCombobox", fieldbackground=[("readonly", t["panel"])], foreground=[("readonly", t["text"])],
+                  selectbackground=[("readonly", t["panel"])], selectforeground=[("readonly", t["text"])])
 
-        header = tk.Frame(self.root, bg=BG)
-        header.pack(fill="x", padx=24, pady=(20, 16))
-        tk.Label(header, text="AirInk", font=("Helvetica", 26, "bold"), bg=BG, fg=TEXT).pack(side="left")
-        tk.Label(header, textvariable=self.status, font=("Helvetica", 11),
-                 bg="#e5eaf4", fg="#35527c", padx=14, pady=7).pack(side="right")
+        self.build_header()
+        body = tk.Frame(self.root, bg=t["bg"])
+        body.pack(padx=PAD)
+        left = tk.Frame(body, bg=t["panel"], width=LEFT, height=HEIGHT)
+        left.pack(side="left")
+        left.pack_propagate(False)
+        self.screen = tk.Label(body, bd=0, bg=t["panel"], cursor="none" if sys.platform == "darwin" else "crosshair")
+        self.screen.pack(side="left", padx=GAP)
+        self.screen.bind("<ButtonPress-1>", lambda e: self.camera is None and self.begin((e.x, e.y)))
+        self.screen.bind("<B1-Motion>", self.mouse_move)
+        self.screen.bind("<ButtonRelease-1>", lambda e: self.camera is None and self.end())
+        self.screen.bind("<Motion>", self.mouse_move)
+        self.screen.bind("<Leave>", lambda e: setattr(self, "hover", None))
+        right = tk.Frame(body, bg=t["panel"], width=RIGHT, height=HEIGHT)
+        right.pack(side="left")
+        right.pack_propagate(False)
+        self.build_left(left)
+        self.build_right(right)
 
-        body = tk.Frame(self.root, bg=BG)
-        body.pack(padx=24)
-        self.screen = tk.Label(body, bd=0, bg=PANEL)
-        self.screen.pack(side="left")
-        self.screen.bind("<Button-1>", self.mouse_draw)
-        self.screen.bind("<B1-Motion>", self.mouse_draw)
-        self.screen.bind("<ButtonRelease-1>", lambda event: self.reset_stroke())
-        panel = tk.Frame(body, bg=PANEL, width=196, height=HEIGHT)
-        panel.pack(side="left", fill="y", padx=(16, 0))
-        panel.pack_propagate(False)
+        bottom = tk.Frame(self.root, bg=t["bg"])
+        bottom.pack(fill="x", padx=PAD, pady=(GAP, PAD))
+        tk.Label(bottom, text="☝ Only index up: draw    ✋ Open hand: pause    ✌ Hold two fingers: undo",
+                 font=(FONT, 11), bg=t["bg"], fg=t["muted"]).pack(side="left")
+        tk.Label(bottom, textvariable=self.toast_text, font=(FONT, 11, "bold"),
+                 bg=t["bg"], fg=t["accent"]).pack(side="left", padx=16)
+        for text, command, accent in (("⬇ Save PNG", self.save, True), ("◉ Snapshot", self.snapshot, False),
+                                      ("▦ Gallery", self.gallery, False), ("Open…", self.open_drawing, False)):
+            self.chip(bottom, text, command, accent=accent).pack(side="right", padx=(6, 0))
+        self.set_status(*self.status_state)
+        self.refresh_chips()
 
-        def title(text):
-            tk.Label(panel, text=text, bg=PANEL, fg=MUTED, font=("Helvetica", 10, "bold"),
-                     anchor="w").pack(fill="x", padx=18, pady=(14, 6))
+    def build_header(self):
+        t, width, height = self.t, TOTAL - 2 * PAD, 64
+        canvas = tk.Canvas(self.root, width=width, height=height, bg=t["bg"], highlightthickness=0, bd=0)
+        canvas.pack(padx=PAD, pady=(PAD, GAP))
+        self.banner = ImageTk.PhotoImage(art.banner(width, height, t["grad"], t["bg"]))
+        canvas.create_image(0, 0, image=self.banner, anchor="nw")
+        canvas.create_text(24, height / 2, text="✿ AirInk", font=(FONT, 24, "bold"), fill="white", anchor="w")
+        canvas.create_text(168, height / 2 + 2, text="draw in the air with your finger",
+                           font=(FONT, 12), fill="white", anchor="w")
+        x = 470
+        for label, variable, values, command in (("Theme", self.theme, list(THEMES), self.change_theme),
+                                                 ("Board", self.board, art.BOARDS, self.change_board)):
+            canvas.create_text(x, height / 2, text=label, font=(FONT, 12, "bold"), fill="white", anchor="w")
+            box = ttk.Combobox(canvas, textvariable=variable, values=values, state="readonly",
+                               width=13, font=(FONT, 11))
+            box.bind("<<ComboboxSelected>>", lambda event, command=command: command())
+            canvas.create_window(x + 56, height / 2, window=box, anchor="w")
+            x += 240
+        self.status_pill = tk.Label(canvas, textvariable=self.status, font=(FONT, 12, "bold"),
+                                    fg="white", bg=STATUS_COLORS["idle"], padx=14, pady=6)
+        canvas.create_window(width - 18, height / 2, window=self.status_pill, anchor="e")
+        self.status_kind = None
 
-        def choices(variable, names):
-            row = tk.Frame(panel, bg=PANEL)
-            row.pack(fill="x", padx=16)
-            for name in names:
-                ttk.Radiobutton(row, text=name, value=name, variable=variable,
-                                command=self.reset_stroke).pack(side="left")
+    def build_left(self, panel):
+        self.camera_button = self.chip(panel, "■ Stop camera" if self.camera else "● Start camera",
+                                       self.toggle_camera, accent=True)
+        self.camera_button.pack(fill="x", padx=12, pady=(14, 0))
+        self.title(panel, "TOOLS")
+        for name, icon in TOOLS:
+            self.choice(panel, f"{icon}  {name}", self.tool, name, self.change_tool).pack(fill="x", padx=12, pady=2)
+        self.title(panel, "EDIT")
+        for text, command in (("↶  Undo", self.undo), ("↷  Redo", self.redo), ("✕  Clear", self.clear)):
+            self.chip(panel, text, command, anchor="w").pack(fill="x", padx=12, pady=2)
+        self.title(panel, "CAMERA VIEW")
+        row = tk.Frame(panel, bg=self.t["panel"])
+        row.pack(fill="x", padx=12)
+        for name in ("Camera", "Board"):
+            self.choice(row, name, self.view, name, size=10, padx=4).pack(side="left", expand=True, fill="x", padx=1)
+        self.title(panel, "CAMERA FADE")
+        ttk.Scale(panel, from_=0, to=100, variable=self.opacity).pack(fill="x", padx=14)
 
-        self.camera_button = ttk.Button(panel, text="Start camera", style="Accent.TButton",
-                                        command=self.toggle_camera)
-        self.camera_button.pack(fill="x", padx=16, pady=(18, 0))
-        title("TOOL")
-        choices(self.tool, ("Pen", "Eraser"))
-        title("COLOUR")
-        row = tk.Frame(panel, bg=PANEL)
-        row.pack(padx=16)
-        self.swatches = {}
-        for index, color in enumerate(COLORS):
-            swatch = tk.Label(row, bg=color, width=2, height=1, bd=3,
-                              relief="solid" if color == self.color else "flat")
-            swatch.grid(row=0, column=index, padx=2, pady=4)
+    def build_right(self, panel):
+        t = self.t
+        self.options = tk.Frame(panel, bg=t["panel"])
+        self.options.pack(fill="x")
+        self.show_options()
+        self.title(panel, "COLOUR")
+        grid = tk.Frame(panel, bg=t["panel"])
+        grid.pack(padx=12, anchor="w")
+        for index, color in enumerate(PALETTE):
+            swatch = tk.Label(grid, bg=color, width=2, height=1, cursor="hand2",
+                              highlightthickness=3, highlightbackground=t["panel"])
+            swatch.grid(row=index // 6, column=index % 6, padx=2, pady=2)
             swatch.bind("<Button-1>", lambda event, c=color: self.choose_color(c))
             self.swatches[color] = swatch
-        title("BRUSH SIZE")
-        ttk.Scale(panel, from_=2, to=24, variable=self.size).pack(fill="x", padx=18)
-        title("VIEW")
-        choices(self.view, ("Camera", "Board"))
-        title("CAMERA OPACITY")
-        ttk.Scale(panel, from_=0, to=100, variable=self.opacity).pack(fill="x", padx=18)
+        row = tk.Frame(panel, bg=t["panel"])
+        row.pack(fill="x", padx=14, pady=(6, 0))
+        self.preview = tk.Label(row, bg=self.color, width=3, highlightthickness=1, highlightbackground=t["muted"])
+        self.preview.pack(side="left")
+        entry = tk.Entry(row, textvariable=self.hex, width=8, font=(FONT, 11), relief="flat", bg=t["button"],
+                         fg=t["text"], insertbackground=t["text"], highlightthickness=0)
+        entry.pack(side="left", padx=6, ipady=4)
+        entry.bind("<Return>", lambda event: self.typed_color())
+        self.chip(row, "◍ Custom", self.pick_color, size=10).pack(side="left", fill="x", expand=True)
+        self.title(panel, "SIZE   ( [ and ] keys )")
+        ttk.Scale(panel, from_=2, to=24, variable=self.size).pack(fill="x", padx=16)
+        self.title(panel, "INK OPACITY")
+        ttk.Scale(panel, from_=10, to=100, variable=self.alpha).pack(fill="x", padx=16)
+        self.mark_color()
 
-        row = tk.Frame(panel, bg=PANEL)
-        row.pack(side="bottom", fill="x", padx=16, pady=(0, 18))
-        ttk.Button(row, text="Open", width=5, command=self.open_drawing).pack(side="left", expand=True, fill="x")
-        ttk.Button(row, text="Save", width=5, style="Accent.TButton", command=self.save).pack(
-            side="left", expand=True, fill="x", padx=(6, 0))
-        ttk.Button(panel, text="Clear", command=self.clear).pack(side="bottom", fill="x", padx=16, pady=(0, 8))
-        tk.Label(self.root, text="Only index up: draw     •     More fingers: pause     •     Camera off: use mouse",
-                 font=("Helvetica", 11), bg=BG, fg=MUTED).pack(pady=16)
+    def show_options(self):
+        """The top of the right panel changes with the tool: brushes, shapes or flowers."""
+        for child in self.options.winfo_children():
+            child.destroy()
+        self.chips = [chip for chip in self.chips if chip[2].winfo_exists()]
+        tool, t = self.tool.get(), self.t
+        if tool == "Eraser":
+            self.title(self.options, "ERASER")
+            tk.Label(self.options, text="Rub with your finger (or drag the mouse) to erase. "
+                     "SIZE sets the eraser width.", wraplength=RIGHT - 32, justify="left",
+                     font=(FONT, 11), bg=t["panel"], fg=t["text"]).pack(fill="x", padx=14)
+            return
+        title, variable, names = {"Draw": ("BRUSH", self.brush, BRUSHES),
+                                  "Shapes": ("SHAPE", self.shape, art.SHAPES),
+                                  "Flowers": ("FLOWER STAMP", self.flower, art.FLOWERS)}[tool]
+        self.title(self.options, title)
+        grid = tk.Frame(self.options, bg=t["panel"])
+        grid.pack(fill="x", padx=10)
+        grid.columnconfigure((0, 1), weight=1, uniform="column")
+        for index, name in enumerate(names):
+            label = (BRUSHES[name][0] if tool == "Draw" else
+                     f"{(SHAPE_ICONS if tool == 'Shapes' else FLOWER_ICONS)[name]} {name}")
+            self.choice(grid, label, variable, name, self.end, size=10, padx=6).grid(
+                row=index // 2, column=index % 2, sticky="ew", padx=2, pady=2)
+        toggles = {"Shapes": ((self.fill, "Fill"),),
+                   "Flowers": ((self.natural, "Natural"), (self.stem, "Stem"), (self.trail, "Scatter"))}.get(tool, ())
+        row = tk.Frame(self.options, bg=t["panel"])
+        row.pack(fill="x", padx=10, pady=(4, 0))
+        row.columnconfigure((0, 1), weight=1, uniform="column")
+        for index, (variable, text) in enumerate(toggles):
+            self.toggle(row, text, variable).grid(row=index // 2, column=index % 2, sticky="ew", padx=2, pady=2)
 
+    def title(self, parent, text):
+        tk.Label(parent, text=text, bg=self.t["panel"], fg=self.t["muted"], font=(FONT, 9, "bold"),
+                 anchor="w").pack(fill="x", padx=14, pady=(12, 4))
+
+    def chip(self, parent, text, command, accent=False, size=11, anchor="center", padx=10):
+        """A flat, colourful button that looks the same on every platform."""
+        t = self.t
+        colors = ("white", t["accent"]) if accent else (t["text"], t["button"])
+        label = tk.Label(parent, text=text, fg=colors[0], bg=colors[1], padx=padx, pady=5, anchor=anchor,
+                         font=(FONT, size, "bold" if accent else "normal"), cursor="hand2")
+        label.colors = colors
+        label.bind("<Button-1>", lambda event: command())
+        label.bind("<Enter>", lambda event: label.colors[1] == t["button"] and label.configure(bg=t["hover"]))
+        label.bind("<Leave>", lambda event: label.configure(bg=label.colors[1]))
+        return label
+
+    def choice(self, parent, text, variable, value, command=None, size=11, padx=10):
+        def pick():
+            variable.set(value)
+            self.refresh_chips()
+            if command:
+                command()
+        label = self.chip(parent, text, pick, size=size, anchor="w", padx=padx)
+        self.chips.append((variable, value, label))
+        self.refresh_chips()
+        return label
+
+    def toggle(self, parent, text, variable):
+        def flip():
+            variable.set(not variable.get())
+            self.refresh_chips()
+        label = self.chip(parent, text, flip, size=10, padx=6)
+        self.chips.append((variable, True, label))
+        self.refresh_chips()
+        return label
+
+    def refresh_chips(self):
+        t = self.t
+        for variable, value, label in self.chips:
+            if not label.winfo_exists():
+                continue
+            on = variable.get() == value
+            if isinstance(variable, tk.BooleanVar):
+                label.configure(text=("☑ " if on else "☐ ") + label.cget("text").lstrip("☑☐ "))
+            label.colors = ("white", t["accent"]) if on else (t["text"], t["button"])
+            label.configure(fg=label.colors[0], bg=label.colors[1])
+
+    def set_status(self, text, kind):
+        self.status_state = (text, kind)
+        if self.status.get() != text:
+            self.status.set(text)
+        if self.status_kind != kind:
+            self.status_pill.configure(bg=STATUS_COLORS[kind])
+            self.status_kind = kind
+
+    def toast(self, text):
+        self.toast_text.set(text)
+        if self.toast_id:
+            self.root.after_cancel(self.toast_id)
+        self.toast_id = self.root.after(2500, lambda: self.toast_text.set(""))
+
+    def change_theme(self):
+        self.save_settings()
+        self.root.after_idle(self.build_ui)  # don't destroy the combobox inside its own event
+
+    def change_board(self):
+        self.save_settings()
+        self.root.focus_set()
+
+    def change_tool(self):
+        self.end()
+        self.show_options()
+
+    def nudge_size(self, step):
+        self.size.set(int(np.clip(self.size.get() + step, 2, 24)))
+
+    # ---------- colour ----------
     def choose_color(self, color):
-        self.reset_stroke()
-        self.color = color
-        self.tool.set("Pen")
+        self.end()
+        self.color = color.lower()
+        self.hex.set(self.color)
+        if self.tool.get() == "Eraser":
+            self.tool.set("Draw")
+            self.refresh_chips()
+            self.show_options()
+        self.mark_color()
+
+    def mark_color(self):
         for value, swatch in self.swatches.items():
-            swatch.configure(relief="solid" if value == color else "flat")
+            swatch.configure(highlightbackground=self.t["text"] if value == self.color else self.t["panel"])
+        self.preview.configure(bg=self.color)
+
+    def pick_color(self):
+        chosen = colorchooser.askcolor(color=self.color, parent=self.root, title="Choose ink colour")[1]
+        if chosen:
+            self.choose_color(chosen)
+
+    def typed_color(self):
+        value = self.hex.get().strip().lstrip("#")
+        if len(value) == 3:
+            value = "".join(ch * 2 for ch in value)
+        try:
+            int(value, 16)
+            if len(value) != 6:
+                raise ValueError
+        except ValueError:
+            self.hex.set(self.color)
+            return self.toast("Type a colour like #ff66aa")
+        self.choose_color("#" + value)
+        self.root.focus_set()
 
     # ---------- camera ----------
     def toggle_camera(self):
@@ -186,23 +447,24 @@ class AirInk:
                 tracker.close()
             messagebox.showerror("Camera could not start", str(error))
             return
+        self.end()
         self.camera, self.tracker = camera, tracker
         self.pose_frames = self.failed_reads = 0
-        self.reset_stroke()
-        self.camera_button.configure(text="Stop camera")
-        self.status.set("Show your hand")
+        self.camera_button.configure(text="■ Stop camera")
+        self.set_status("Show your hand", "idle")
 
     def stop_camera(self):
         if self.camera is not None:
             self.camera.release()
         if self.tracker is not None:
             self.tracker.close()
-        self.camera = self.tracker = None
+        self.camera = self.tracker = self.last_frame = None
         self.pose_frames = 0
+        self.peace_since = None
         self.smoother.reset()
-        self.reset_stroke()
-        self.camera_button.configure(text="Start camera")
-        self.status.set("Camera off")
+        self.end()
+        self.camera_button.configure(text="● Start camera")
+        self.set_status("Camera off · draw with the mouse", "idle")
 
     def camera_view(self, frame):
         """Centre-crop the camera to 16:9 so it is never stretched."""
@@ -218,16 +480,91 @@ class AirInk:
         x, y = (tip.x - left) / width, (tip.y - top) / height
         return (x * (WIDTH - 1), y * (HEIGHT - 1)) if 0 <= x <= 1 and 0 <= y <= 1 else None
 
+    # ---------- actions: begin, move, end ----------
+    def clip(self, point):
+        return np.clip(np.array(point, dtype=float), 0, (WIDTH - 1, HEIGHT - 1))
+
+    def begin(self, point):
+        self.end()
+        point, tool = self.clip(point), self.tool.get()
+        self.active, self.stroke = tool, []
+        self.travel, self.carry, self.hue0 = 0.0, np.inf, self.rng.random()
+        if tool == "Draw":
+            brush = self.brush.get()
+            glow = max(4.0, self.size.get() * 1.2) if brush == "Neon" else 0.0
+            self.layer.start(BRUSHES[brush][1] * self.alpha.get() / 100, glow)
+            self.draw(point)
+        elif tool == "Eraser":
+            self.push_undo()
+            self.draw(point)
+        elif tool == "Shapes":
+            self.layer.start(self.alpha.get() / 100)
+            self.shape_start = point
+            self.shape_to(point)
+        else:
+            self.push_undo()
+            self.place_flower(point)
+
+    def move(self, point, camera=False):
+        if self.active is None:
+            return
+        point = self.clip(point)
+        if self.active in ("Draw", "Eraser"):
+            self.draw(point, camera)
+        elif self.active == "Shapes":
+            self.shape_to(point)
+        elif self.trail.get() and np.linalg.norm(point - self.last_stamp) > self.flower_radius() * 1.8:
+            self.place_flower(point)
+
+    def end(self):
+        if self.active is None:
+            return
+        if self.active in ("Draw", "Eraser"):
+            self.reset_stroke()
+        if self.active == "Shapes" and np.linalg.norm(self.shape_end - self.shape_start) < 4:
+            self.layer.clear()  # a click, not a drag: no shape
+        if not self.layer.empty:
+            self.push_undo()
+            self.layer.merge(self.ink, self.mask)
+            self.layer.clear()
+        self.active = None
+
+    def mouse_move(self, event):
+        self.hover = (event.x, event.y)
+        if self.camera is None and self.active is not None:
+            self.move((event.x, event.y))
+
+    # ---------- undo ----------
+    def push_undo(self):
+        self.undo_stack.append((self.ink.copy(), self.mask.copy()))
+        del self.undo_stack[:-UNDO_LIMIT]
+        self.redo_stack.clear()
+
+    def undo(self):
+        self.end()
+        if not self.undo_stack:
+            return self.toast("Nothing to undo")
+        self.redo_stack.append((self.ink, self.mask))
+        self.ink, self.mask = self.undo_stack.pop()
+        self.toast(f"↶ Undone  ({len(self.undo_stack)} more)")
+
+    def redo(self):
+        self.end()
+        if not self.redo_stack:
+            return self.toast("Nothing to redo")
+        self.undo_stack.append((self.ink, self.mask))
+        self.ink, self.mask = self.redo_stack.pop()
+        self.toast("↷ Redone")
+
     # ---------- drawing ----------
     def reset_stroke(self):
-        """End the stroke: finish the last half-segment, then start fresh."""
+        """End the curve: finish the last half-segment, then start fresh."""
         if len(self.stroke) >= 2:
             self.paint([(self.stroke[-2] + self.stroke[-1]) / 2, self.stroke[-1]])
         self.stroke = []
 
-    def draw(self, point, camera=True):
+    def draw(self, point, camera=False):
         """Add a point to the stroke and draw a smooth curve through the last three points."""
-        point = np.clip(np.array(point, dtype=float), 0, (WIDTH - 1, HEIGHT - 1))
         if camera and self.stroke and np.linalg.norm(point - self.stroke[-1]) > 120:
             self.reset_stroke()  # tracking jump: don't draw a bridge
         self.stroke = (self.stroke + [point])[-3:]
@@ -240,57 +577,131 @@ class AirInk:
             t = np.linspace(0, 1, 12)[:, None]
             self.paint((1 - t) ** 2 * (a + b) / 2 + 2 * (1 - t) * t * b + t ** 2 * (b + c) / 2)
 
+    def walk(self, curve, spacing):
+        """Points spaced evenly along the stroke, carrying the gap over between calls."""
+        points = []
+        if self.carry >= spacing:  # the very first point of a stroke
+            points.append(curve[0])
+            self.carry = 0.0
+        for a, b in zip(curve[:-1], curve[1:]):
+            length = np.linalg.norm(b - a)
+            at = spacing - self.carry
+            while at <= length:
+                points.append(a + (b - a) * at / length)
+                at += spacing
+            self.carry = (self.carry + length) % spacing if length else self.carry
+        return points
+
     def paint(self, curve):
-        line = [np.round(np.array(curve) * 16).astype(np.int32)]  # 4-bit sub-pixel precision
-        erase = self.tool.get() == "Eraser"
-        width = max(24, self.size.get() * 4) if erase else max(2, self.size.get())
-        if not erase:
-            color = tuple(int(self.color[i:i + 2], 16) for i in (1, 3, 5))
-            cv2.polylines(self.ink, line, False, color, width + 2, cv2.LINE_8, shift=4)
-        cv2.polylines(self.mask, line, False, 0 if erase else 255, width, cv2.LINE_AA, shift=4)
+        curve = np.asarray(curve, dtype=float)
+        size, p = self.size.get(), self.painter
+        if self.active == "Eraser":
+            cv2.polylines(self.mask, [art.fixed(curve)], False, 0, max(24, size * 4), cv2.LINE_AA, art.SHIFT)
+            return
+        brush, color = self.brush.get(), art.rgb(self.color)
+        if brush == "Pen":
+            p.line(curve, color, size)
+        elif brush == "Marker":
+            p.line(curve, color, size * 2.2)
+        elif brush == "Highlighter":
+            p.line(curve, color, size * 3.5)
+        elif brush == "Neon":
+            p.line(curve, color, size, ink_width=size + self.layer.glow * 6)
+        elif brush == "Rainbow":
+            p.line(curve, art.hue(self.hue0 + self.travel / 400), size * 1.5)
+        elif brush == "Calligraphy":
+            p.nib(curve, color, size * 2.2)
+        elif brush == "Chalk":
+            p.chalk(curve, color, size * 1.8)
+        elif brush == "Dotted":
+            p.dots(self.walk(curve, size * 2.6 + 4), size * 0.8 + 1, color)
+        elif brush == "Spray":
+            for center in self.walk(curve, 3):
+                spread = self.rng.normal(0, size * 1.1, (4 + size // 3, 2))
+                p.dots(center + spread, 0.8, color)
+        self.travel += np.linalg.norm(np.diff(curve, axis=0), axis=1).sum()
 
-    def mouse_draw(self, event):
-        if self.camera is None:
-            self.draw((event.x, event.y), camera=False)
+    def shape_to(self, point):
+        self.shape_end = point
+        self.layer.clear()
+        color, size = art.rgb(self.color), self.size.get()
+        for points, closed, solid in art.shape_outline(self.shape.get(), self.shape_start, point):
+            if solid or (closed and self.fill.get()):
+                self.painter.polygon(points, color)
+            self.painter.line(points, color, size, closed)
 
-    def compose(self, background=None):
-        """Blend ink over the camera (faded by opacity) or over white."""
-        white = np.full_like(self.ink, 255)
-        if background is None:
-            background = white
-        else:
+    def flower_radius(self):
+        return 14 + self.size.get() * 4
+
+    def place_flower(self, point):
+        color = None if self.natural.get() else art.rgb(self.color)
+        self.layer.start(self.alpha.get() / 100)
+        art.flower(self.painter, self.flower.get(), point, self.flower_radius(), color, self.stem.get(), self.rng)
+        self.layer.merge(self.ink, self.mask)
+        self.layer.clear()
+        self.last_stamp = point
+
+    def board_image(self):
+        name = self.board.get()
+        if name not in self.boards:
+            self.boards[name] = art.board(name)
+        return self.boards[name]
+
+    def compose(self, camera_frame=None):
+        """Blend ink over the board, or over the camera faded into the board."""
+        background = self.board_image()
+        if camera_frame is not None:
             opacity = self.opacity.get() / 100
-            background = cv2.addWeighted(background, opacity, white, 1 - opacity, 0)
-        alpha = self.mask[:, :, None].astype(np.uint16)
-        return ((self.ink * alpha + background * (255 - alpha)) // 255).astype(np.uint8)
+            background = cv2.addWeighted(camera_frame, opacity, background, 1 - opacity, 0)
+        ink, mask = self.ink, self.mask
+        if not self.layer.empty:
+            ink, mask = ink.copy(), mask.copy()
+            self.layer.merge(ink, mask)
+        alpha = mask[:, :, None].astype(np.uint16)
+        return ((ink * alpha + background * (255 - alpha)) // 255).astype(np.uint8)
+
+    def draw_cursor(self, picture, point):
+        center, tool, size = tuple(int(v) for v in point), self.tool.get(), self.size.get()
+        color = art.rgb(self.color)
+        radius = {"Eraser": max(24, size * 4) / 2, "Flowers": self.flower_radius(), "Shapes": 5}.get(
+            tool, max(4, size * {"Marker": 2.2, "Highlighter": 3.5, "Spray": 2.2}.get(self.brush.get(), 1) / 2))
+        if tool == "Eraser":
+            color = (120, 120, 120)
+        cv2.circle(picture, center, int(radius) + 2, (255, 255, 255), 4, cv2.LINE_AA)
+        cv2.circle(picture, center, int(radius) + 2, color, 2, cv2.LINE_AA)
+        if self.peace_since is not None and not self.peace_done:
+            progress = min(1.0, (time.monotonic() - self.peace_since) / UNDO_HOLD)
+            cv2.ellipse(picture, center, (30, 30), -90, 0, 360 * progress, (147, 51, 234), 5, cv2.LINE_AA)
 
     # ---------- main loop ----------
     def tick(self):
-        background = point = None
+        point = None
         try:
             if self.camera is not None:
-                background, point = self.camera_step()
+                self.last_frame, point = self.camera_step()
         except Exception as error:
             self.stop_camera()
             messagebox.showerror("Camera stopped", str(error))
         try:
-            picture = self.compose(background)
-            if self.camera is not None and point is not None:
-                cv2.circle(picture, tuple(int(v) for v in point), 10, (22, 155, 131), 2, cv2.LINE_AA)
+            frame = self.last_frame if self.view.get() == "Camera" else None
+            picture = self.compose(frame)
+            cursor = point if self.camera is not None else self.hover
+            if cursor is not None:
+                self.draw_cursor(picture, cursor)
             self.photo = ImageTk.PhotoImage(Image.fromarray(picture))
             self.screen.configure(image=self.photo)
         finally:
             self.after_id = self.root.after(15, self.tick)
 
     def camera_step(self):
-        """Read one frame, track the hand, draw if the pose holds; return (background, point)."""
+        """Read one frame, track the hand, act on the pose; return (camera picture, fingertip)."""
         ok, frame = self.camera.read()
         if not ok:  # macOS often returns empty frames while the camera warms up
             self.failed_reads += 1
             if self.failed_reads > 100:
                 raise RuntimeError("Camera disconnected. You can continue with the mouse.")
-            self.status.set("Starting camera…")
-            return None, None
+            self.set_status("Starting camera…", "idle")
+            return self.last_frame, None
         self.failed_reads = 0
         frame = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
         self.timestamp = max(self.timestamp + 1, time.monotonic_ns() // 1_000_000)
@@ -303,7 +714,8 @@ class AirInk:
             self.smoother.reset()
         else:
             point = self.smoother(point, self.timestamp / 1000)
-        writing = point is not None and writing_pose(hand)
+        pose = gesture(hand) if hand else None
+        writing = point is not None and pose == "point"
         # Start after 3 good frames; stop after 3 missed ones, so one bad frame won't split a line.
         self.missed = 0 if writing else self.missed + 1
         if writing:
@@ -312,49 +724,146 @@ class AirInk:
             self.pose_frames = 0
         drawing = writing and self.pose_frames >= 3
         if drawing:
-            self.draw(point)
+            if self.active is None:
+                self.begin(point)
+            else:
+                self.move(point, camera=True)
         elif self.pose_frames < 3:
-            self.reset_stroke()
-        self.status.set(("Drawing" if self.tool.get() == "Pen" else "Erasing") if drawing else
-                        "Move / pause" if hand else "Show your hand")
-        return (preview if self.view.get() == "Camera" else None), point
+            self.end()
+        self.undo_gesture(pose)
+        self.set_status(*self.describe(pose, drawing))
+        return preview, point
+
+    def undo_gesture(self, pose):
+        """Hold ✌ (index + middle finger) still for a moment to undo once."""
+        now = time.monotonic()
+        if pose == "peace" and self.active is None:
+            self.peace_missed = 0
+            if self.peace_since is None:
+                self.peace_since = now
+            if not self.peace_done and now - self.peace_since >= UNDO_HOLD:
+                self.peace_done = True
+                self.undo()
+        else:
+            self.peace_missed += 1
+            if self.peace_missed > 4:
+                self.peace_since, self.peace_done = None, False
+
+    def describe(self, pose, drawing):
+        if pose is None:
+            return "Show your hand", "idle"
+        if drawing:
+            return {"Draw": f"☝ Drawing · {self.brush.get()}", "Eraser": "☝ Erasing",
+                    "Shapes": f"☝ Shaping · {self.shape.get()}",
+                    "Flowers": f"☝ Planting · {self.flower.get()}"}[self.tool.get()], "draw"
+        if pose == "peace":
+            return ("✌ Undone!" if self.peace_done else "✌ Hold to undo…"), "undo"
+        return {"palm": "✋ Open hand · paused", "fist": "✊ Fist · paused",
+                "point": "☝ Getting ready…"}.get(pose, "Paused · raise only your index"), "pause"
 
     # ---------- files ----------
     def clear(self):
-        self.ink.fill(0)
-        self.mask.fill(0)
+        self.end()
+        if not self.mask.any():
+            return
+        self.push_undo()
+        self.ink = np.zeros_like(self.ink)
+        self.mask = np.zeros_like(self.mask)
         self.pose_frames = 0
-        self.reset_stroke()
+        self.toast("Cleared — Undo brings it back")
 
     def save(self):
+        self.end()
         try:
             folder = storage_folder()
-            folder.mkdir(parents=True, exist_ok=True)
-            path = folder / f"AirInk-{datetime.now():%Y%m%d-%H%M%S-%f}.png"
-            Image.fromarray(self.compose()).save(path, format="PNG")
-            self.root.title(f"AirInk — Saved {path.name}")
+            (folder / ".layers").mkdir(parents=True, exist_ok=True)
+            name = f"AirInk-{datetime.now():%Y%m%d-%H%M%S-%f}.png"
+            Image.fromarray(self.compose()).save(folder / name, format="PNG")
+            # A transparent copy of just the ink, so Open can keep editing on any board.
+            Image.fromarray(np.dstack([self.ink, self.mask])).save(folder / ".layers" / name, format="PNG")
+            self.toast(f"Saved {name}")
         except OSError as error:
             messagebox.showerror("Could not save", str(error))
 
-    def open_drawing(self):
+    def snapshot(self):
+        """Save exactly what is on screen, camera included."""
         try:
-            folder = storage_folder()
+            folder = app_folder() / "snapshots"
             folder.mkdir(parents=True, exist_ok=True)
-            path = filedialog.askopenfilename(title="Open saved drawing", initialdir=str(folder),
-                                              filetypes=[("PNG drawings", "*.png")])
-            if not path:
-                return
-            with Image.open(path) as image:
+            frame = self.last_frame if self.camera is not None and self.view.get() == "Camera" else None
+            path = folder / f"AirInk-Snap-{datetime.now():%Y%m%d-%H%M%S-%f}.png"
+            Image.fromarray(self.compose(frame)).save(path, format="PNG")
+            self.toast(f"Snapshot saved to {folder.name}/")
+        except OSError as error:
+            messagebox.showerror("Could not save snapshot", str(error))
+
+    def open_drawing(self):
+        folder = storage_folder()
+        folder.mkdir(parents=True, exist_ok=True)
+        path = filedialog.askopenfilename(title="Open saved drawing", initialdir=str(folder),
+                                          filetypes=[("PNG drawings", "*.png")])
+        if path:
+            self.load_drawing(Path(path))
+
+    def load_drawing(self, path):
+        try:
+            layer = path.parent / ".layers" / path.name
+            source = layer if layer.exists() else path
+            with Image.open(source) as image:
                 if image.format != "PNG" or image.size != (WIDTH, HEIGHT):
                     raise ValueError("Choose a 960 × 540 PNG saved by AirInk.")
-                rgba = image.convert("RGBA")
-                self.ink = np.array(Image.alpha_composite(Image.new("RGBA", image.size, "white"), rgba).convert("RGB"))
-            self.mask = np.any(self.ink != 255, axis=2).astype(np.uint8) * 255
+                if source == layer:
+                    rgba = np.array(image.convert("RGBA"))
+                    ink, mask = rgba[..., :3].copy(), rgba[..., 3].copy()
+                else:  # older saves: ink on white
+                    white = Image.new("RGBA", image.size, "white")
+                    ink = np.array(Image.alpha_composite(white, image.convert("RGBA")).convert("RGB"))
+                    mask = np.any(ink != 255, axis=2).astype(np.uint8) * 255
+            self.end()
+            self.push_undo()
+            self.ink, self.mask = ink, mask
             self.pose_frames = 0
-            self.reset_stroke()
-            self.root.title(f"AirInk — {Path(path).name}")
+            self.root.title(f"AirInk — {path.name}")
+            self.toast(f"Opened {path.name}")
         except (OSError, ValueError) as error:
             messagebox.showerror("Could not open", str(error))
+
+    def gallery(self):
+        """Thumbnails of the latest saved drawings; click one to keep drawing on it."""
+        t = self.t
+        files = sorted(storage_folder().glob("AirInk-*.png"), reverse=True)[:12]
+        window = tk.Toplevel(self.root, bg=t["bg"], padx=16, pady=16)
+        window.title("AirInk Gallery")
+        window.resizable(False, False)
+        window.thumbs = []
+        tk.Label(window, text="✿ Your drawings", font=(FONT, 18, "bold"), bg=t["bg"], fg=t["text"]).grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        if not files:
+            tk.Label(window, text="Nothing saved yet — press Save PNG to start your gallery.",
+                     font=(FONT, 12), bg=t["bg"], fg=t["muted"]).grid(row=1, column=0, columnspan=4)
+
+        def pick(path):
+            window.destroy()
+            self.load_drawing(path)
+
+        for index, path in enumerate(files):
+            try:
+                with Image.open(path) as image:
+                    image.thumbnail((224, 126))
+                    photo = ImageTk.PhotoImage(image)
+            except OSError:
+                continue
+            window.thumbs.append(photo)
+            cell = tk.Frame(window, bg=t["panel"], padx=6, pady=6)
+            cell.grid(row=1 + index // 4, column=index % 4, padx=6, pady=6)
+            picture = tk.Label(cell, image=photo, bg=t["panel"], cursor="hand2")
+            picture.pack()
+            stamp = datetime.fromtimestamp(path.stat().st_mtime)
+            tk.Label(cell, text=f"{stamp:%d %b · %H:%M}", font=(FONT, 10), bg=t["panel"], fg=t["muted"]).pack()
+            for widget in (cell, picture):
+                widget.bind("<Button-1>", lambda event, path=path: pick(path))
+        self.chip(window, "Open another file…", lambda: (window.destroy(), self.open_drawing())).grid(
+            row=10, column=0, columnspan=4, pady=(10, 0))
 
     def close(self):
         if self.after_id is None:

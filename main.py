@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 import cv2
 import mediapipe as mp
@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 import art
+import db
 from art import HEIGHT, WIDTH
 
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +23,7 @@ FONT = "Segoe UI" if sys.platform == "win32" else "Helvetica"
 PAD, GAP, LEFT, RIGHT = 18, 12, 136, 236
 TOTAL = 2 * PAD + LEFT + 2 * GAP + WIDTH + RIGHT
 UNDO_LIMIT, UNDO_HOLD = 30, 1.2  # undo steps kept; seconds to hold ✌ for undo
+SESSION_COUNTS = ("strokes", "shapes", "flowers", "erases", "undos", "saves")  # columns of the sessions table
 
 PALETTE = ("#2563eb", "#06b6d4", "#169b83", "#22c55e", "#facc15", "#f97316",
            "#e34b65", "#ec4899", "#8b5cf6", "#92400e", "#172033", "#ffffff")
@@ -120,6 +122,14 @@ class AirInk:
         self.peace_since, self.peace_missed, self.peace_done = None, 0, False
         self.crop, self.toast_id, self.boards = (0, 0, 1, 1), None, {}
         self.status_state = ("Camera off · draw with the mouse", "idle")
+        self.session_id, self.session_start = None, datetime.now().replace(microsecond=0)
+        self.stats = dict.fromkeys(SESSION_COUNTS, 0)
+        self.used_camera = False
+        try:
+            db.init_db()
+            self.db_error = None
+        except db.Error as error:
+            self.db_error = str(error)
 
         settings = self.load_settings()
         self.theme = tk.StringVar(value=settings.get("theme") if settings.get("theme") in THEMES else "Pastel Dream")
@@ -143,6 +153,8 @@ class AirInk:
                 root.bind(key, lambda event, action=action: action())
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Escape>", lambda event: self.close())
+        if self.db_error:
+            self.toast("MySQL not connected: saving files only")
         self.tick()
 
     # ---------- settings ----------
@@ -201,12 +213,13 @@ class AirInk:
 
         bottom = tk.Frame(self.root, bg=t["bg"])
         bottom.pack(fill="x", padx=PAD, pady=(GAP, PAD))
-        tk.Label(bottom, text="☝ Only index up: draw    ✋ Open hand: pause    ✌ Hold two fingers: undo",
+        tk.Label(bottom, text="☝ Index up: draw   ✋ Open hand: pause   ✌ Hold two: undo",
                  font=(FONT, 11), bg=t["bg"], fg=t["muted"]).pack(side="left")
-        tk.Label(bottom, textvariable=self.toast_text, font=(FONT, 11, "bold"),
-                 bg=t["bg"], fg=t["accent"]).pack(side="left", padx=16)
+        tk.Label(bottom, textvariable=self.toast_text, font=(FONT, 11, "bold"), width=44, anchor="w",
+                 bg=t["bg"], fg=t["accent"]).pack(side="left", padx=12)
         for text, command, accent in (("⬇ Save PNG", self.save, True), ("◉ Snapshot", self.snapshot, False),
-                                      ("▦ Gallery", self.gallery, False), ("Open…", self.open_drawing, False)):
+                                      ("▦ Gallery", self.gallery, False), ("▤ My stats", self.show_stats, False),
+                                      ("Open…", self.open_drawing, False)):
             self.chip(bottom, text, command, accent=accent).pack(side="right", padx=(6, 0))
         self.set_status(*self.status_state)
         self.refresh_chips()
@@ -449,6 +462,7 @@ class AirInk:
             return
         self.end()
         self.camera, self.tracker = camera, tracker
+        self.used_camera = True
         self.pose_frames = self.failed_reads = 0
         self.camera_button.configure(text="■ Stop camera")
         self.set_status("Show your hand", "idle")
@@ -523,7 +537,10 @@ class AirInk:
             self.reset_stroke()
         if self.active == "Shapes" and np.linalg.norm(self.shape_end - self.shape_start) < 4:
             self.layer.clear()  # a click, not a drag: no shape
+        if self.active == "Eraser":
+            self.stats["erases"] += 1
         if not self.layer.empty:
+            self.stats["shapes" if self.active == "Shapes" else "strokes"] += 1
             self.push_undo()
             self.layer.merge(self.ink, self.mask)
             self.layer.clear()
@@ -546,6 +563,7 @@ class AirInk:
             return self.toast("Nothing to undo")
         self.redo_stack.append((self.ink, self.mask))
         self.ink, self.mask = self.undo_stack.pop()
+        self.stats["undos"] += 1
         self.toast(f"↶ Undone  ({len(self.undo_stack)} more)")
 
     def redo(self):
@@ -640,6 +658,7 @@ class AirInk:
         self.layer.merge(self.ink, self.mask)
         self.layer.clear()
         self.last_stamp = point
+        self.stats["flowers"] += 1
 
     def board_image(self):
         name = self.board.get()
@@ -781,9 +800,19 @@ class AirInk:
             Image.fromarray(self.compose()).save(folder / name, format="PNG")
             # A transparent copy of just the ink, so Open can keep editing on any board.
             Image.fromarray(np.dstack([self.ink, self.mask])).save(folder / ".layers" / name, format="PNG")
-            self.toast(f"Saved {name}")
+            self.stats["saves"] += 1
         except OSError as error:
-            messagebox.showerror("Could not save", str(error))
+            return messagebox.showerror("Could not save", str(error))
+        title = f"Drawing {datetime.now():%d %b %H:%M}"
+        try:
+            if not self.database_ready():
+                raise db.Error(self.db_error)
+            db.run("INSERT INTO drawings (title, file_name, theme, board) VALUES (%s, %s, %s, %s)",
+                   (title, name, self.theme.get(), self.board.get()))
+            self.record_session()
+            self.toast(f"Saved “{title}”")
+        except db.Error:
+            self.toast("Saved as a file (MySQL not connected)")
 
     def snapshot(self):
         """Save exactly what is on screen, camera included."""
@@ -828,42 +857,263 @@ class AirInk:
         except (OSError, ValueError) as error:
             messagebox.showerror("Could not open", str(error))
 
+    # ---------- MySQL: gallery and stats ----------
+    def database_ready(self):
+        """True when MySQL is reachable; retries if it was down when AirInk started."""
+        if self.db_error:
+            try:
+                db.init_db()
+                self.db_error = None
+            except db.Error as error:
+                self.db_error = str(error)
+        return self.db_error is None
+
+    def record_session(self):
+        """Write this session's counts to the sessions table (the row appears on the first activity)."""
+        if self.session_id is None and not (any(self.stats.values()) or self.used_camera):
+            return
+        values = [datetime.now()] + [self.stats[key] for key in SESSION_COUNTS] + [self.used_camera]
+        if self.session_id is None:
+            self.session_id = db.run(
+                "INSERT INTO sessions (started_at, ended_at, strokes, shapes, flowers, erases, undos, saves,"
+                " used_camera) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)", [self.session_start] + values)
+        else:
+            db.run("UPDATE sessions SET ended_at=%s, strokes=%s, shapes=%s, flowers=%s, erases=%s, undos=%s,"
+                   " saves=%s, used_camera=%s WHERE id=%s", values + [self.session_id])
+
+    def sync_drawings(self):
+        """Add rows for PNGs saved while MySQL was off, or by an older AirInk."""
+        known = {row[0] for row in db.run("SELECT file_name FROM drawings", fetch=True)}
+        for path in sorted(storage_folder().glob("AirInk-*.png")):
+            if path.name not in known:
+                stamp = datetime.fromtimestamp(path.stat().st_mtime).replace(microsecond=0)
+                db.run("INSERT INTO drawings (title, file_name, created_at) VALUES (%s, %s, %s)",
+                       (f"Drawing {stamp:%d %b %H:%M}", path.name, stamp))
+
+    def find_drawings(self, text=""):
+        """Rows (id, title, theme, board, created_at, file_name) matching a title, theme, board or date."""
+        self.sync_drawings()
+        like = f"%{text}%"
+        rows = db.run("SELECT id, title, theme, board, created_at, file_name FROM drawings"
+                      " WHERE title LIKE %s OR theme LIKE %s OR board LIKE %s OR CAST(created_at AS CHAR) LIKE %s"
+                      " ORDER BY created_at DESC, id DESC", (like,) * 4, fetch=True)
+        return rows, db.run("SELECT COUNT(*) FROM drawings", fetch=True)[0][0]
+
+    def rename_drawing(self, file_name, title):
+        db.run("UPDATE drawings SET title=%s WHERE file_name=%s", (title.strip()[:100], file_name))
+
+    def delete_drawing(self, file_name):
+        """Remove the row, then the PNG and its editable ink layer."""
+        db.run("DELETE FROM drawings WHERE file_name=%s", (file_name,))
+        for path in (storage_folder() / file_name, storage_folder() / ".layers" / file_name):
+            path.unlink(missing_ok=True)
+
+    def table(self, parent, columns, height):
+        """A themed Treeview: columns = [(key, heading, width, anchor)]."""
+        t, style = self.t, ttk.Style()
+        style.configure("AirInk.Treeview", background=t["panel"], fieldbackground=t["panel"], foreground=t["text"],
+                        rowheight=28, font=(FONT, 11), borderwidth=0)
+        style.map("AirInk.Treeview", background=[("selected", t["accent"])], foreground=[("selected", "white")])
+        style.configure("AirInk.Treeview.Heading", background=t["button"], foreground=t["text"],
+                        font=(FONT, 11, "bold"), relief="flat", borderwidth=0)
+        style.map("AirInk.Treeview.Heading", background=[("active", t["hover"])])
+        frame = tk.Frame(parent, bg=t["panel"])
+        tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", height=height,
+                            style="AirInk.Treeview", selectmode="browse")
+        for key, heading, width, anchor in columns:
+            tree.heading(key, text=heading)
+            tree.column(key, width=width, anchor=anchor, stretch=False)
+        tree.pack(side="left")
+        bar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        bar.pack(side="left", fill="y")
+        tree.configure(yscrollcommand=bar.set)
+        tree.tag_configure("odd", background=t["bg"])
+        return frame, tree
+
     def gallery(self):
-        """Thumbnails of the latest saved drawings; click one to keep drawing on it."""
-        t = self.t
-        files = sorted(storage_folder().glob("AirInk-*.png"), reverse=True)[:12]
-        window = tk.Toplevel(self.root, bg=t["bg"], padx=16, pady=16)
+        """Saved drawings from MySQL: search by title or date, preview, open, rename or delete."""
+        self.end()
+        t, folder = self.t, storage_folder()
+        window = tk.Toplevel(self.root, bg=t["bg"], padx=18, pady=16)
         window.title("AirInk Gallery")
         window.resizable(False, False)
-        window.thumbs = []
-        tk.Label(window, text="✿ Your drawings", font=(FONT, 18, "bold"), bg=t["bg"], fg=t["text"]).grid(
-            row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
-        if not files:
-            tk.Label(window, text="Nothing saved yet — press Save PNG to start your gallery.",
-                     font=(FONT, 12), bg=t["bg"], fg=t["muted"]).grid(row=1, column=0, columnspan=4)
+        top = tk.Frame(window, bg=t["bg"])
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        tk.Label(top, text="✿ Your drawings", font=(FONT, 18, "bold"), bg=t["bg"], fg=t["text"]).pack(side="left")
+        query = tk.StringVar()
+        self.chip(top, "Show all", lambda: (query.set(""), load())).pack(side="right", padx=(6, 0))
+        self.chip(top, "⌕ Search", lambda: load(), accent=True).pack(side="right", padx=(6, 0))
+        entry = tk.Entry(top, textvariable=query, width=22, font=(FONT, 12), relief="flat", bg=t["panel"],
+                         fg=t["text"], insertbackground=t["text"], highlightthickness=1,
+                         highlightbackground=t["hover"], highlightcolor=t["accent"])
+        entry.pack(side="right", ipady=5)
+        entry.bind("<Return>", lambda event: load())
+        tk.Label(top, text="Title, theme, board or date (2026-11-18)", font=(FONT, 10), bg=t["bg"],
+                 fg=t["muted"]).pack(side="right", padx=8)
+        frame, tree = self.table(window, (("id", "ID", 48, "center"), ("title", "Title", 230, "w"),
+                                          ("theme", "Theme", 118, "w"), ("board", "Board", 110, "w"),
+                                          ("saved", "Saved", 160, "center")), height=12)
+        frame.grid(row=1, column=0, sticky="n")
+        side = tk.Frame(window, bg=t["panel"], padx=14, pady=14)
+        side.grid(row=1, column=1, sticky="ns", padx=(14, 0))
+        preview = tk.Label(side, bg=t["panel"], fg=t["muted"], font=(FONT, 11))
+        preview.pack()
+        name = tk.Label(side, bg=t["panel"], fg=t["text"], font=(FONT, 13, "bold"), wraplength=300)
+        name.pack(pady=(8, 10))
+        info = tk.StringVar()
+        tk.Label(window, textvariable=info, font=(FONT, 10), bg=t["bg"], fg=t["muted"]).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        rows = {}
 
-        def pick(path):
-            window.destroy()
-            self.load_drawing(path)
+        def fetch(text):
+            if self.database_ready():
+                try:
+                    found, total = self.find_drawings(text)
+                    info.set(f"{len(found)} of {total} drawings · MySQL database “{db.DB_CONFIG['database']}”")
+                    return found
+                except db.Error as error:
+                    self.db_error = str(error)
+            info.set("MySQL not connected — showing files from the drawings folder. Rename and delete need MySQL.")
+            files = sorted(folder.glob("AirInk-*.png"), reverse=True)
+            return [("—", f.stem, None, None, datetime.fromtimestamp(f.stat().st_mtime), f.name)
+                    for f in files if text.lower() in f.name.lower()]
 
-        for index, path in enumerate(files):
-            try:
+        def load():
+            tree.delete(*tree.get_children())
+            rows.clear()
+            for index, row in enumerate(fetch(query.get().strip())):
+                rows[row[5]] = row
+                tree.insert("", "end", iid=row[5], tags=("odd",) if index % 2 else (),
+                            values=(row[0], row[1], row[2] or "—", row[3] or "—", f"{row[4]:%d %b %Y · %H:%M}"))
+            if rows:
+                tree.selection_set(next(iter(rows)))
+            show()
+
+        def selected():
+            choice = tree.selection()
+            return rows.get(choice[0]) if choice else None
+
+        def show(event=None):
+            row = selected()
+            path = folder / row[5] if row else None
+            if path is not None and path.exists():
                 with Image.open(path) as image:
-                    image.thumbnail((224, 126))
-                    photo = ImageTk.PhotoImage(image)
-            except OSError:
-                continue
-            window.thumbs.append(photo)
-            cell = tk.Frame(window, bg=t["panel"], padx=6, pady=6)
-            cell.grid(row=1 + index // 4, column=index % 4, padx=6, pady=6)
-            picture = tk.Label(cell, image=photo, bg=t["panel"], cursor="hand2")
-            picture.pack()
-            stamp = datetime.fromtimestamp(path.stat().st_mtime)
-            tk.Label(cell, text=f"{stamp:%d %b · %H:%M}", font=(FONT, 10), bg=t["panel"], fg=t["muted"]).pack()
-            for widget in (cell, picture):
-                widget.bind("<Button-1>", lambda event, path=path: pick(path))
-        self.chip(window, "Open another file…", lambda: (window.destroy(), self.open_drawing())).grid(
-            row=10, column=0, columnspan=4, pady=(10, 0))
+                    image.thumbnail((320, 180))
+                    window.photo = ImageTk.PhotoImage(image)
+                preview.configure(image=window.photo, text="")
+            else:
+                window.photo = ImageTk.PhotoImage(Image.new("RGB", (320, 180), t["bg"]))
+                preview.configure(image=window.photo, text="File missing" if row else "No drawings yet",
+                                  compound="center")
+            name.configure(text=row[1] if row else "")
+
+        def open_it(event=None):
+            row = selected()
+            if row and (folder / row[5]).exists():
+                window.destroy()
+                self.load_drawing(folder / row[5])
+
+        def rename():
+            row = selected()
+            if not row or row[0] == "—":
+                return
+            title = simpledialog.askstring("Rename drawing", "New title:", initialvalue=row[1], parent=window)
+            if title and title.strip():
+                try:
+                    self.rename_drawing(row[5], title)
+                except db.Error as error:
+                    return messagebox.showerror("Database Error", str(error), parent=window)
+                load()
+                tree.selection_set(row[5])
+
+        def delete():
+            row = selected()
+            if not row or row[0] == "—":
+                return
+            if not messagebox.askyesno("Delete drawing", f"Delete “{row[1]}”? This removes the PNG too.",
+                                       parent=window):
+                return
+            try:
+                self.delete_drawing(row[5])
+            except db.Error as error:
+                return messagebox.showerror("Database Error", str(error), parent=window)
+            load()
+
+        for text, command, accent in (("Open", open_it, True), ("✎ Rename", rename, False),
+                                      ("✕ Delete", delete, False),
+                                      ("Open another file…", lambda: (window.destroy(), self.open_drawing()), False)):
+            self.chip(side, text, command, accent=accent).pack(fill="x", pady=3)
+        tree.bind("<<TreeviewSelect>>", show)
+        tree.bind("<Double-1>", open_it)
+        load()
+        entry.focus_set()
+
+    def show_stats(self):
+        """Totals, a 7-day chart and recent sessions, all read from the sessions table."""
+        self.end()
+        t = self.t
+        if not self.database_ready():
+            return messagebox.showinfo("My stats", f"Stats are stored in MySQL, which is not connected.\n\n{self.db_error}")
+        try:
+            self.record_session()
+            totals = db.run("SELECT COUNT(*), COALESCE(SUM(TIMESTAMPDIFF(SECOND, started_at, ended_at)), 0),"
+                            " COALESCE(SUM(strokes), 0), COALESCE(SUM(shapes), 0), COALESCE(SUM(flowers), 0),"
+                            " COALESCE(SUM(undos), 0) FROM sessions", fetch=True)[0]
+            saved = db.run("SELECT COUNT(*) FROM drawings", fetch=True)[0][0]
+            recent = db.run("SELECT started_at, TIMESTAMPDIFF(SECOND, started_at, ended_at), strokes, shapes,"
+                            " flowers, erases, undos, saves, used_camera FROM sessions"
+                            " ORDER BY started_at DESC LIMIT 12", fetch=True)
+            days = dict(db.run("SELECT DATE(started_at), SUM(strokes + shapes + flowers) FROM sessions"
+                               " WHERE started_at >= CURDATE() - INTERVAL 6 DAY GROUP BY DATE(started_at)",
+                               fetch=True))
+        except db.Error as error:
+            return messagebox.showerror("Database Error", str(error))
+        sessions, seconds, strokes, shapes, flowers, undos = (int(v) for v in totals)
+        window = tk.Toplevel(self.root, bg=t["bg"], padx=18, pady=16)
+        window.title("AirInk — My stats")
+        window.resizable(False, False)
+        tk.Label(window, text="▤ My drawing stats", font=(FONT, 18, "bold"), bg=t["bg"], fg=t["text"]).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        now = ", ".join(f"{self.stats[k]} {k}" for k in ("strokes", "shapes", "flowers", "undos"))
+        tk.Label(window, text=f"This session: {now}", font=(FONT, 11), bg=t["bg"], fg=t["muted"]).grid(
+            row=0, column=1, sticky="e")
+        tiles = tk.Frame(window, bg=t["bg"])
+        tiles.grid(row=1, column=0, columnspan=2, sticky="ew", pady=12)
+        minutes = round(seconds / 60)
+        for index, (value, label) in enumerate(((sessions, "Sessions"),
+                                                (f"{minutes // 60} h {minutes % 60} m" if minutes >= 60 else
+                                                 f"{minutes} min", "Time drawing"),
+                                                (strokes, "Strokes"), (shapes, "Shapes"), (flowers, "Flowers"),
+                                                (undos, "Undos"), (saved, "Drawings saved"))):
+            tile = tk.Frame(tiles, bg=t["panel"], padx=16, pady=10)
+            tile.grid(row=0, column=index, padx=(0 if index == 0 else 8, 0), sticky="nsew")
+            tiles.columnconfigure(index, weight=1, uniform="tile")
+            tk.Label(tile, text=str(value), font=(FONT, 20, "bold"), bg=t["panel"], fg=t["accent"]).pack()
+            tk.Label(tile, text=label, font=(FONT, 10), bg=t["panel"], fg=t["muted"]).pack()
+        chart = tk.Canvas(window, width=340, height=300, bg=t["panel"], highlightthickness=0)
+        chart.grid(row=2, column=0, sticky="n")
+        chart.create_text(16, 18, text="Marks made · last 7 days", anchor="w", font=(FONT, 11, "bold"),
+                          fill=t["text"])
+        dates = [datetime.now().date().fromordinal(datetime.now().date().toordinal() - k) for k in range(6, -1, -1)]
+        values = [int(days.get(d, 0) or 0) for d in dates]
+        top = max(values + [1])
+        for index, (day, value) in enumerate(zip(dates, values)):
+            x = 30 + index * 44
+            height = 200 * value / top
+            chart.create_rectangle(x, 260 - height, x + 28, 260, fill=t["accent"], width=0)
+            chart.create_text(x + 14, 252 - height, text=str(value), anchor="s", font=(FONT, 10), fill=t["text"])
+            chart.create_text(x + 14, 278, text=f"{day:%a}", font=(FONT, 10), fill=t["muted"])
+        frame, tree = self.table(window, (("started", "Started", 150, "center"), ("minutes", "Min", 50, "center"),
+                                          ("strokes", "Strokes", 70, "center"), ("shapes", "Shapes", 66, "center"),
+                                          ("flowers", "Flowers", 70, "center"), ("erases", "Erases", 62, "center"),
+                                          ("undos", "Undos", 60, "center"), ("saves", "Saves", 56, "center"),
+                                          ("camera", "Camera", 66, "center")), height=9)
+        frame.grid(row=2, column=1, sticky="n", padx=(14, 0))
+        for index, row in enumerate(recent):
+            started, seconds, *counts, camera = row
+            tree.insert("", "end", tags=("odd",) if index % 2 else (),
+                        values=(f"{started:%d %b · %H:%M}", max(1, round((seconds or 0) / 60)), *counts,
+                                "✓" if camera else "—"))
 
     def close(self):
         if self.after_id is None:
@@ -871,6 +1121,11 @@ class AirInk:
         self.root.after_cancel(self.after_id)
         self.after_id = None
         self.stop_camera()
+        try:
+            if self.db_error is None:
+                self.record_session()
+        except db.Error:
+            pass
         self.root.destroy()
 
 

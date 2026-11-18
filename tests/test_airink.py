@@ -1,5 +1,11 @@
-"""AirInk checks. Run from the project folder: .venv/bin/python -m unittest discover tests"""
+"""AirInk checks. Run from the project folder: .venv/bin/python -m unittest discover tests
 
+MySQL checks use a separate database (airink_test) that is created and dropped here,
+and are skipped when MySQL is not running.
+"""
+
+import os
+import shutil
 import sys
 import tempfile
 import time
@@ -11,9 +17,28 @@ from types import SimpleNamespace as P
 import numpy as np
 from PIL import Image
 
+os.environ["DB_NAME"] = "airink_test"  # never touch the real airink_db
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import art  # noqa: E402
+import db  # noqa: E402
 import main  # noqa: E402
+
+
+def drop_test_database():
+    server = {k: v for k, v in db.DB_CONFIG.items() if k != "database"}
+    conn = db.mysql.connector.connect(connection_timeout=3, **server)
+    try:
+        conn.cursor().execute("DROP DATABASE IF EXISTS airink_test")
+    finally:
+        conn.close()
+
+
+try:
+    drop_test_database()
+    MYSQL = True
+except db.Error:
+    MYSQL = False
+needs_mysql = unittest.skipUnless(MYSQL, "MySQL is not running")
 
 
 def hand(raised, x=0.5, y=0.5, thumb_open=False):
@@ -60,10 +85,17 @@ class AirInkTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.root.destroy()
         cls.folder.cleanup()
+        if MYSQL:
+            drop_test_database()
 
     def setUp(self):
         for child in self.root.winfo_children():
             child.destroy()
+        shutil.rmtree(main.storage_folder(), ignore_errors=True)
+        if MYSQL:
+            db.init_db()
+            db.run("DELETE FROM drawings")
+            db.run("DELETE FROM sessions")
         self.app = main.AirInk(self.root)
         self.root.after_cancel(self.app.after_id)
 
@@ -279,6 +311,7 @@ class AirInkTest(unittest.TestCase):
                     self.app.tool.set(tool)
                     self.app.show_options()
                     self.root.update_idletasks()
+                    self.assertLessEqual(self.root.winfo_reqwidth(), main.TOTAL)
                     for panel in (self.app.screen.master.winfo_children()[0], self.app.options.master):
                         bottom = max(c.winfo_y() + c.winfo_height() for c in panel.winfo_children())
                         self.assertLessEqual(bottom, panel.winfo_height())
@@ -292,6 +325,104 @@ class AirInkTest(unittest.TestCase):
         self.app.hex.set("nope")
         self.app.typed_color()
         self.assertEqual(self.app.color, "#ff66aa")
+
+
+    # ---------- MySQL ----------
+    @needs_mysql
+    def test_save_adds_a_drawing_row(self):
+        self.app.theme.set("Neon Night")
+        self.app.board.set("Blackboard")
+        self.stroke(self.line())
+        self.app.save()
+        rows, total = self.app.find_drawings()
+        self.assertEqual(total, 1)
+        _, title, theme, board, _, file_name = rows[0]
+        self.assertTrue(title.startswith("Drawing "))
+        self.assertEqual((theme, board), ("Neon Night", "Blackboard"))
+        self.assertTrue((main.storage_folder() / file_name).exists())
+
+    @needs_mysql
+    def test_search_by_title_board_and_date(self):
+        self.stroke(self.line())
+        self.app.save()
+        self.app.board.set("Grid paper")
+        self.app.save()
+        rows, _ = self.app.find_drawings()
+        self.app.rename_drawing(rows[0][5], "Sunflower garden")
+        self.assertEqual(len(self.app.find_drawings("garden")[0]), 1)
+        self.assertEqual(len(self.app.find_drawings("Grid paper")[0]), 1)
+        self.assertEqual(len(self.app.find_drawings(f"{main.datetime.now():%Y-%m-%d}")[0]), 2)
+        self.assertEqual(len(self.app.find_drawings("no such drawing")[0]), 0)
+
+    @needs_mysql
+    def test_delete_removes_the_row_and_files(self):
+        self.stroke(self.line())
+        self.app.save()
+        file_name = self.app.find_drawings()[0][0][5]
+        self.app.delete_drawing(file_name)
+        self.assertEqual(self.app.find_drawings()[1], 0)
+        self.assertFalse((main.storage_folder() / file_name).exists())
+        self.assertFalse((main.storage_folder() / ".layers" / file_name).exists())
+
+    @needs_mysql
+    def test_older_files_join_the_gallery(self):
+        main.storage_folder().mkdir(parents=True)
+        Image.new("RGB", (960, 540), "white").save(main.storage_folder() / "AirInk-20250101-120000-000000.png")
+        rows, total = self.app.find_drawings()
+        self.assertEqual(total, 1)
+        self.assertTrue(rows[0][1].startswith("Drawing "))
+
+    @needs_mysql
+    def test_session_counts_are_recorded_in_one_row(self):
+        self.stroke(self.line())
+        self.stroke(self.line(300))
+        self.app.tool.set("Shapes")
+        self.stroke([(300, 150), (500, 300)])
+        self.app.tool.set("Flowers")
+        self.stroke([(480, 200)])
+        self.app.tool.set("Eraser")
+        self.stroke(self.line())
+        self.app.undo()
+        self.app.save()  # saving also records the session
+        self.app.record_session()
+        rows = db.run("SELECT strokes, shapes, flowers, erases, undos, saves, used_camera FROM sessions", fetch=True)
+        self.assertEqual(rows, [(2, 1, 1, 1, 1, 1, 0)])
+
+    @needs_mysql
+    def test_no_session_row_without_activity(self):
+        self.app.record_session()
+        self.assertEqual(db.run("SELECT COUNT(*) FROM sessions", fetch=True)[0][0], 0)
+
+    @needs_mysql
+    def test_gallery_and_stats_windows_open(self):
+        self.stroke(self.line())
+        self.app.save()
+        self.app.gallery()
+        self.app.show_stats()
+        windows = [w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel)]
+        self.assertEqual([w.title() for w in windows], ["AirInk Gallery", "AirInk — My stats"])
+
+    def test_app_still_works_without_mysql(self):
+        saved, shown = dict(db.DB_CONFIG), []
+        db.DB_CONFIG.update(host="127.0.0.1", port=1)  # nothing listens here
+        original = main.messagebox.showinfo
+        main.messagebox.showinfo = lambda *args, **kwargs: shown.append(args)
+        try:
+            app = main.AirInk(self.root)
+            self.root.after_cancel(app.after_id)
+            self.assertIsNotNone(app.db_error)
+            app.begin((100, 100))
+            app.move((300, 300))
+            app.end()
+            app.save()
+            self.assertEqual(len(list(main.storage_folder().glob("AirInk-*.png"))), 1)
+            app.gallery()
+            app.show_stats()
+            self.assertEqual(len(shown), 1)  # "Stats are stored in MySQL…"
+        finally:
+            db.DB_CONFIG.clear()
+            db.DB_CONFIG.update(saved)
+            main.messagebox.showinfo = original
 
 
 if __name__ == "__main__":

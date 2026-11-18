@@ -60,4 +60,10 @@ To run again, open the project folder in a terminal:
 
 Snapshots go to the sibling `snapshots/` folder. **Open** starts in the drawings folder.
 
+## MySQL gallery and session stats
+
+Start a local MySQL server before launching AirInk. Set `DB_HOST`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` as needed (defaults: `localhost`, `root`, empty password, `airink_db`). On first use, AirInk creates the database and tables if the database does not already exist and the account has permission. For a preconfigured database, have an administrator create the tables using `schema.sql` with the matching database name.
+
+Gallery uses MySQL to search, rename, and delete drawing entries. My stats shows session history. Without MySQL, PNG saving and opening still work, and Gallery lists local drawings.
+
 Run the checks with `.venv/bin/python -m unittest discover tests` (Windows: `.venv\Scripts\python -m unittest discover tests`). The report and presentation (PDF + editable files) are in `documents/`.
